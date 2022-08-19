@@ -5,14 +5,18 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/jung-kurt/gofpdf"
 )
 
 const campsFilename = "brc_api_2022/camps.json"
 const artFilename = "brc_api_2022/art.json"
 const eventsFilename = "brc_api_2022/events.json"
-const outputFileName = "out/food-guide.txt"
+const outputFileName = "out/food-guide.pdf"
+
+const lineHeight = 4
 
 const timestampLayout = "2006-01-02T15:04:05-07:00"
 
@@ -70,7 +74,10 @@ type Event struct {
 
 type FormattedEvent struct {
     ID int64
-    Times string
+    Day string
+    ShortTimes string
+    LongTimes string
+    StartTime string
     Duration time.Duration
     EventName string
     EventDescription string
@@ -133,6 +140,12 @@ func main() {
 
     fmt.Println("Parsing Events")
 
+    longestTime := ""
+    longestAddress := ""
+    longestLocationName := ""
+    longestEventName := ""
+    longestDescription := ""
+
     eventsFile, err := os.Open(eventsFilename)
     if err != nil {
         panic(err)
@@ -149,6 +162,7 @@ func main() {
 		panic(fmt.Sprintf("Failed to decode initial array open bracket: %+v", err))
 	}
 	
+    events := 0
     entries := 0
 
 	for decoder.More() {
@@ -160,6 +174,8 @@ func main() {
         if event.EventType.ID != 5 {
             continue
         }
+
+        events++
 
         for _, occurrence := range event.OccurrenceSet {
             entries++
@@ -205,10 +221,12 @@ func main() {
 
             optionalSecondDate := ""
             if (startTime.Day() != endTime.Day()) {
-                optionalSecondDate = endTime.Format("1/2 ")
+                optionalSecondDate = endTime.Format("Mon ")
             }
 
-            timeString := fmt.Sprintf("%s %s - %s%s", startTime.Format("1/2"), formatMinimumMinutes(startTime), optionalSecondDate, formatMinimumMinutes(endTime))
+            dayString := startTime.Format("Mon 1/2")
+            shortTimeString := fmt.Sprintf("%s - %s%s", formatMinimumMinutes(startTime), optionalSecondDate, formatMinimumMinutes(endTime)) 
+            longTimeString := fmt.Sprintf("%s %s - %s%s", startTime.Format("Mon"), formatMinimumMinutes(startTime), optionalSecondDate, formatMinimumMinutes(endTime))
             
             address := ""
             locationName := ""
@@ -228,12 +246,32 @@ func main() {
 
             var formattedEvent = FormattedEvent{
                 ID: event.Id,
-                Times: timeString,
+                Day: dayString,
+                ShortTimes: shortTimeString,
+                LongTimes: longTimeString,
+                StartTime: fmt.Sprintf("%s %s", startTime.Format("Mon 1/2 "), formatMinimumMinutes(startTime)),
                 Duration: duration,
                 EventName: event.Title,
                 EventDescription: event.Description,
                 Address: address,
                 LocationName: locationName,
+            }
+
+            // track longest entries to allow PDF formatting
+            if utf8.RuneCountInString(longestTime) < utf8.RuneCountInString(formattedEvent.LongTimes) {
+                longestTime = formattedEvent.LongTimes
+            }
+            if utf8.RuneCountInString(longestAddress) < utf8.RuneCountInString(formattedEvent.Address) {
+                longestAddress = formattedEvent.Address
+            }
+            if utf8.RuneCountInString(longestLocationName) < utf8.RuneCountInString(formattedEvent.LocationName) {
+                longestLocationName = formattedEvent.LocationName
+            }
+            if utf8.RuneCountInString(longestEventName) < utf8.RuneCountInString(formattedEvent.EventName) {
+                longestEventName = formattedEvent.EventName
+            }
+            if utf8.RuneCountInString(longestDescription) < utf8.RuneCountInString(formattedEvent.EventDescription) {
+                longestDescription = formattedEvent.EventDescription
             }
 
             day, exists := formattedEvents[dayKey]
@@ -258,17 +296,35 @@ func main() {
 
     fmt.Println("Writing sorted, formatted events to file")
 
-    outFile, err := os.Create(outputFileName)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to open file for writing: %+v", err))
-	}
-	defer outFile.Close()
+    footerStartTime := ""
+
+    var footerStartTimePointer *string
+
+    footerStartTimePointer = &footerStartTime
+
+    // Setup Document
+    pdf := gofpdf.New("P", "mm", "Letter", "")
+    make_title_page(pdf)
+    pdf.AddPage()
+    pdf.SetFont("Arial", "", 8)
+    pdf.SetLeftMargin(14)
+    tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+    pdf.SetFooterFunc(func() {
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.CellFormat(0, 10, *footerStartTimePointer,
+			"", 0, "C", false, 0, "")
+	})
 
     dayKeys := make([]string, 0, len(formattedEvents))
     for k := range formattedEvents{
         dayKeys = append(dayKeys, k)
     }
     sort.Strings(dayKeys)
+
+    lastPage := -1
+    lastDay := ""
 
     for _, dayKey := range dayKeys {
 
@@ -280,43 +336,78 @@ func main() {
 
         for _, timeKey := range timeKeys {
             for _, entry := range formattedEvents[dayKey][timeKey] {
-                outFile.WriteString(
-                    fmt.Sprintf("%s\t%s\t%s\n\t%s\n",
-                        entry.Times,
-                        entry.Address,
-                        entry.LocationName,
-                        word_wrap(
-                            fmt.Sprintf("%s:  %s", entry.EventName, entry.EventDescription),
-                            120,
-                            "\t",
-                        ),
-                    ),
-                )
+                if lastPage < pdf.PageNo() {
+                    lastPage = pdf.PageNo()
+                    *footerStartTimePointer = entry.StartTime
+                }
+                
+                pdf.SetX(12)
+                pdf.SetFontSize(13)
+                pdf.Write(lineHeight, tr("\u2022"))
+                pdf.SetFontSize(8)
+                pdf.SetX(14)
+                pdf.SetFontStyle("B")
+                pdf.Write(lineHeight, tr(entry.EventName))
+                pdf.SetFontStyle("")
+                pdf.SetX(pdf.GetX()+3)
+                displayTime := entry.ShortTimes
+                if lastDay != entry.Day {
+                    displayTime = entry.LongTimes
+                    lastDay = entry.Day
+                }
+                pdf.Write(lineHeight, displayTime)
+                pdf.SetX(pdf.GetX()+4)
+                if entry.Address != "" {
+                    pdf.Write(lineHeight, fmt.Sprintf("(%s)",tr(entry.Address)))
+                    pdf.SetX(pdf.GetX()+4)
+                }
+                pdf.SetFontStyle("I")
+                pdf.Write(lineHeight, tr(entry.LocationName))
+                pdf.SetFontStyle("")
+                pdf.Write(lineHeight, "\n")
+                pdf.Write(lineHeight, tr(entry.EventDescription))
+                pdf.Write(lineHeight+2, "\n")
             }
         }
     }
 
-    fmt.Printf("Complete!  Wrote %d entries.\n", entries)
+    fmt.Printf("longestTime: %s\n", longestTime)
+    fmt.Printf("longestAddress: %s\n", longestAddress)
+    fmt.Printf("longestLocationName: %s\n", longestLocationName)
+    fmt.Printf("longestEventName: %s\n", longestEventName)
+    fmt.Printf("longestDescription: %s\n", longestDescription)
+
+    err = pdf.OutputFileAndClose(outputFileName)
+    if err != nil {
+        panic(fmt.Sprintf("Failed to write PDF: %+v", err))
+    }
+
+    fmt.Printf("Complete!  Wrote %d occurrences of %d events.\n", events, entries)
 }
 
-// Wraps text at the specified column lineWidth on word breaks
-func word_wrap(text string, lineWidth int, linePrefix string) string {
-	words := strings.Fields(strings.TrimSpace(text))
-	if len(words) == 0 {
-		return text
-	}
-	wrapped := words[0]
-	spaceLeft := lineWidth - len(wrapped)
-	for _, word := range words[1:] {
-		if len(word)+1 > spaceLeft {
-			wrapped += "\n" + linePrefix + word
-			spaceLeft = lineWidth - len(word)
-		} else {
-			wrapped += " " + word
-			spaceLeft -= 1 + len(word)
-		}
-	}
+func make_title_page(pdf *gofpdf.Fpdf) {
+    pdf.AddPage()
+    pdf.SetY(35)
+    pdf.SetFont("Arial", "B", 24)
+    pdf.WriteAligned(0, 20, "Hungry?               Bored?", "C")
 
-	return wrapped
+    pdf.SetFont("Arial", "", 12)
+    pdf.SetY(65)
+    pdf.WriteAligned(0, 14, "Get a fork!                                                            ", "C")
+    pdf.SetY(73)
+    pdf.WriteAligned(0, 14, "Get a friend!                    ", "C")
+    pdf.SetY(81)
+    pdf.WriteAligned(0, 14, "                    Get a bib!", "C")
+    pdf.SetY(89)
+    pdf.WriteAligned(0, 14, "                                                        Get to the", "C")
 
+    pdf.SetY(117)
+    pdf.SetFont("Arial", "B", 38)
+    pdf.WriteAligned(0, 38, "BRC 2022", "C")
+
+    pdf.SetY(137)
+    pdf.SetFont("Arial", "B", 40)
+    pdf.WriteAligned(0, 40, "FOOD EVENTS", "C")
+
+    pdf.Image("tautology-logo-small.png", 106, 230, 0, 0, false, "", 0, "")
 }
